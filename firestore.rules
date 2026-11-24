@@ -1,0 +1,100 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+    
+    function isBuilder() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'builder' ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'builder'
+      );
+    }
+    
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    function isBuyer() {
+      return isAuthenticated() && getUserData().role == 'buyer';
+    }
+    
+    function buyerKeys() {
+      let u = getUserData();
+      return ['all', 'tower:' + u.tower, 'unit:' + u.tower + '-' + u.unit];
+    }
+
+    // Projects: readable by all authenticated users, writable only by builders
+    match /projects/{pid} {
+      allow read: if isAuthenticated();
+      allow write: if isBuilder();
+      
+      // Units: readable by authenticated users; writable by builders
+      // Buyers can update unit uid only during transaction claim
+      match /units/{unitId} {
+        allow read: if isAuthenticated();
+        allow create, delete: if isBuilder();
+        allow update: if isBuilder() || (
+          isAuthenticated() &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['joined', 'uid']) &&
+          request.resource.data.uid == request.auth.uid &&
+          resource.data.joined == false
+        );
+      }
+      
+      // Notices: 
+      // Buyers can read only notices whose audienceKeys intersect their own keys.
+      // Builders can read and write all notices.
+      match /notices/{nid} {
+        allow read: if isBuilder() || (
+          isBuyer() &&
+          resource.data.audienceKeys.hasAny(buyerKeys())
+        );
+        allow write: if isBuilder();
+        
+        // Reads:
+        // Buyers can create only their own reads/{uid} doc, once.
+        // Idempotent create: document ID must match the buyer's uid.
+        match /reads/{uid} {
+          allow read: if isAuthenticated();
+          allow create: if isAuthenticated() && 
+                       request.auth.uid == uid && 
+                       request.resource.data.keys().hasOnly(['readAt', 'uid']);
+          allow update, delete: if false; // Once read, cannot modify or unread
+        }
+      }
+    }
+    
+    // Invites:
+    // Only builders can write notices, units and invites.
+    // Invite redemption is allowed only if the invite is unused and unexpired.
+    match /invites/{code} {
+      allow read: if isAuthenticated();
+      allow create, delete: if isBuilder();
+      allow update: if isBuilder() || (
+        isAuthenticated() &&
+        resource.data.usedBy == null &&
+        resource.data.expiresAt > request.time &&
+        request.resource.data.usedBy == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['usedBy', 'usedAt'])
+      );
+    }
+    
+    // Users:
+    // Users can read and update their own profile document
+    // Builders can read any user doc
+    match /users/{uid} {
+      allow read: if isAuthenticated() && (request.auth.uid == uid || isBuilder());
+      allow create, update: if isAuthenticated() && request.auth.uid == uid;
+      allow delete: if isBuilder();
+    }
+    
+    // Deny everything else by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
